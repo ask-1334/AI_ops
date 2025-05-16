@@ -1,111 +1,139 @@
 version: '3.8'
 
 services:
-  # Our Flask application
   flask-app:
-    build:
-      context: ./app
+    build: ./flask-app
+    container_name: flask-app
     ports:
-      - "5000:5000"
+      - "5000:5000" # Expose app port
+    environment:
+      - FLASK_ENV=production
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317 # gRPC for SDK
+      - OTEL_SERVICE_NAME=flask-app
+      # - PYTHONUNBUFFERED=1 # Ensures logs are sent out immediately
     depends_on:
       - otel-collector
     networks:
-      - observability-network
-    volumes:
-      - ./app:/app
-    environment:
-      # Updated to be precise for gRPC endpoint expected by OTLPSpanExporter and OTLPMetricExporter
-      - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:14317 
+      - observability-net
 
-  # OpenTelemetry Collector
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.60.0 # Using a specific version, consider updating if needed
-    command: ["--config=/etc/otel-collector/config.yaml"]
+    image: otel/opentelemetry-collector-contrib:0.88.0 # Use a specific version
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
     volumes:
-      - ./otel-collector/config.yaml:/etc/otel-collector/config.yaml
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
     ports:
-      - "14317:14317"  # OTLP gRPC receiver
-      - "14318:14318"  # OTLP HTTP receiver
-      - "8889:8889"    # Prometheus exporter
+      - "14317:4317"  # OTLP gRPC receiver
+      - "14318:4318"  # OTLP HTTP receiver
+      - "8889:8889"   # Prometheus exporter endpoint
+      # - "55681:55680" # zPages (optional, for collector self-observability)
     depends_on:
-      - prometheus
-      - loki
-      - jaeger # Changed from tempo to jaeger
+      loki:
+        condition: service_started # Ensure Loki is ready to receive logs
+      jaeger:
+        condition: service_started # Ensure Jaeger is ready to receive traces
     networks:
-      - observability-network
+      - observability-net
 
-  # Prometheus for metrics
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.47.2 # Use a specific version
+    container_name: prometheus
     command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
-      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle' # Allows hot reloading of config via HTTP POST to /-/reload
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus # Persistent storage for metrics
     ports:
       - "9090:9090"
+    depends_on:
+      - flask-app
+      - otel-collector
+      - jaeger # To scrape Jaeger's own metrics
     networks:
-      - observability-network
+      - observability-net
 
-  # Loki for logs
   loki:
-    image: grafana/loki:2.7.0 # Consider updating to a more recent version
-    ports:
-      - "3100:3100"
-    command: -config.file=/etc/loki/local-config.yaml # Assuming you have a local-config.yaml or use default
-    volumes:
-      - loki_data:/loki
-    networks:
-      - observability-network
-
-  # Jaeger for traces (replaces Tempo)
-  jaeger:
-    image: jaegertracing/all-in-one:1.53 # Using a specific version
-    ports:
-      - "6831:6831/udp" # Agent - compact thrift protocol
-      - "6832:6832/udp" # Agent - binary thrift protocol
-      - "5778:5778/tcp"  # Agent - config server
-      - "16686:16686"    # Jaeger UI / Query port
-      - "14268:14268"    # Collector - OTLP HTTP endpoint
-      - "14250:14250"    # Collector - OTLP gRPC endpoint
-    environment:
-      - COLLECTOR_OTLP_ENABLED=true
-      - LOG_LEVEL=info # Can be set to debug for more verbose logging
-    networks:
-      - observability-network
-    # For persistent storage with Badger (optional):
+    image: grafana/loki:2.9.2 # Use a specific version
+    container_name: loki
+    # Default config is usually sufficient for simple setups.
+    # For custom config:
+    # command: ["-config.file=/etc/loki/local-config.yaml"]
     # volumes:
-    #   - jaeger_data:/badger
-
-  # Grafana for visualization
-  grafana:
-    image: grafana/grafana:11.0.0 # Using a recent version, original was 9.3.6/11.6.1
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./grafana/datasources:/etc/grafana/provisioning/datasources
-    # environment: # Kept original commented out Grafana auth settings
-    #   - GF_AUTH_ANONYMOUS_ENABLED=true
-    #   - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
-    #   - GF_AUTH_DISABLE_LOGIN_FORM=true
+    #   - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
     ports:
-      - "3000:3000"
+      - "3100:3100" # Loki API port
+    # volumes:
+    #   - loki_data:/loki # Persistent storage for logs
+    networks:
+      - observability-net
+    # healthcheck:
+    #   test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3100/ready"]
+    #   interval: 10s
+    #   timeout: 5s
+    #   retries: 5
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.50 # Use a specific version
+    container_name: jaeger2
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true # Enable OTLP receiver on gRPC (4317) and HTTP (4318)
+      # Add other Jaeger specific configurations if needed
+      # For example, to specify storage type (default is in-memory for all-in-one)
+      # - SPAN_STORAGE_TYPE=elasticsearch 
+      # - ES_SERVER_URLS=http://elasticsearch:9200
+    ports:
+      # OTLP receivers (if Jaeger directly receives OTLP, though collector handles it here)
+      # - "4317:4317"     # OTLP gRPC
+      # - "4318:4318"     # OTLP HTTP
+      # Jaeger native protocols (Thrift)
+      - "6831:6831/udp" # Agent - Thrift UDP
+      - "6832:6832/udp" # Agent - Thrift UDP
+      - "5778:5778"     # Agent - HTTP
+      # Collector
+      - "14268:14268"   # Collector - HTTP Thrift
+      - "14250:14250"   # Collector - gRPC (Used by OTEL Collector to send to Jaeger)
+      # Query
+      - "16686:16686"   # Query UI / API
+      # - "16685:16685" # Query gRPC
+    networks:
+      - observability-net
+    # healthcheck:
+    #   test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:16686"]
+    #   interval: 10s
+    #   timeout: 5s
+    #   retries: 5
+
+
+  grafana:
+    image: grafana/grafana:10.1.5 # Use a specific version
+    container_name: grafana
+    volumes:
+      - ./grafana/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      # - ./grafana/dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro # For dashboard provisioning
+      # - ./grafana/dashboards:/var/lib/grafana/dashboards:ro # If you have dashboard JSON files
+      - grafana_data:/var/lib/grafana # Persistent storage for Grafana (dashboards, settings)
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # - GF_LOG_LEVEL=debug # For troubleshooting Grafana
+    ports:
+      - "3000:3000" # Grafana UI port
     depends_on:
       - prometheus
       - loki
-      - jaeger # Changed from tempo to jaeger
+      - jaeger
     networks:
-      - observability-network
-
-networks:
-  observability-network:
-    driver: bridge
+      - observability-net
 
 volumes:
-  prometheus_data:
-  loki_data:
-  # tempo_data: # Removed tempo_data
-  grafana_data:
-  # jaeger_data: # Add if using persistent storage for Jaeger
+  prometheus_data: {}
+  # loki_data: {} # Uncomment if you want persistent Loki storage
+  grafana_data: {}
+
+networks:
+  observability-net:
+    driver: bridge
