@@ -1,0 +1,58 @@
+apiVersion: 1
+
+datasources:
+  # Prometheus for metrics
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    basicAuth: false
+    editable: true
+    jsonData:
+      httpMethod: POST
+      exemplarTraceIdDestinations:
+        - name: traceID
+          datasourceUid: jaeger-uid
+          urlDisplayLabel: "View Trace"
+
+  # Elasticsearch for logs
+  - name: Elasticsearch
+    type: elasticsearch
+    access: proxy
+    url: http://elasticsearch:9200
+    database: "[flask-logs-]YYYY.MM.DD"
+    basicAuth: false
+    editable: true
+    jsonData:
+      interval: Daily
+      timeField: "@timestamp"
+      esVersion: "8.0.0"
+      maxConcurrentShardRequests: 5
+      # Derived fields for trace correlation
+      derivedFields:
+        - name: TraceID
+          matcherRegex: "trace_id=([a-f0-9]+)"
+          url: "http://localhost:16686/trace/${__value.raw}"
+          datasourceUid: jaeger-uid
+          urlDisplayLabel: "View Trace in Jaeger"
+
+  # Jaeger for traces
+  - name: Jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    uid: jaeger-uid
+    basicAuth: false
+    editable: true
+    jsonData:
+      # Traces to logs correlation
+      tracesToLogs:
+        datasourceUid: elasticsearch-uid
+        tags: ['service.name']
+        mappedTags: [{ key: 'service.name', value: 'service' }]
+        mapTagNamesEnabled: true
+        spanStartTimeShift: '-1h'
+        spanEndTimeShift: '1h'
+        filterByTraceID: true
+        filterBySpanID: false

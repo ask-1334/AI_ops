@@ -1,0 +1,68 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+  
+  resource:
+    attributes:
+      - key: environment
+        value: development
+        action: upsert
+
+exporters:
+  # Debug logging
+  logging:
+    loglevel: debug
+    
+  # Prometheus metrics exporter
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    const_labels:
+      environment: development
+    
+  # Jaeger traces exporter
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+    
+  # Elasticsearch logs exporter
+  elasticsearch:
+    endpoints: [http://elasticsearch:9200]
+    logs_index: otel-logs
+    traces_index: otel-traces
+    metrics_index: otel-metrics
+    pipeline_batch_size: 100
+    pipeline_batch_timeout: 5s
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [logging, otlp/jaeger]
+      
+    metrics:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [logging, prometheus]
+      
+    logs:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [logging, elasticsearch]
+
+  extensions: []
+  
+  telemetry:
+    logs:
+      level: "debug"
