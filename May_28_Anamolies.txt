@@ -1,0 +1,1048 @@
+Folder Structure
+--------------------------------------------------
+aiops-observability-stack/
+    app.py
+    docker-compose.yml
+    Dockerfile
+    Dockerfile-anomaly
+    Dockerfile-forecast
+    forecast_service.py
+    forecast_service_multi.py
+    log_anomaly_service.py
+    otel-collector-config.yaml
+    prometheus.yml
+    README.md
+    requirements.txt
+    setup.py
+    test_push.py
+
+
+File Contents
+--------------------------------------------------
+
+
+aiops-observability-stack\app.py
+File type: .py
+import flask
+import logging
+import requests
+import os
+import time
+import math
+
+# --- OpenTelemetry Metrics Setup ---
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader # Corrected!
+
+# --- OpenTelemetry Traces Setup ---
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider # Corrected!
+from opentelemetry.sdk.trace.export import BatchSpanProcessor # Corrected!
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter # Corrected!
+from opentelemetry.instrumentation.flask import FlaskInstrumentor # Corrected!
+from opentelemetry.instrumentation.requests import RequestsInstrumentor # Corrected!
+
+# Configure standard Python logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- OpenTelemetry Setup (Existing Log Setup) ---
+from opentelemetry._logs import set_logger_provider # Corrected!
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler # Corrected!
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor # Corrected!
+from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter # Corrected!
+from opentelemetry import _logs as otel_logs # Corrected!
+
+# 1. Configure Resource for service name (for logs, metrics, traces)
+resource = Resource(attributes={
+    "service.name": "flask-otel-app"
+})
+
+# 2. Set up OpenTelemetry Logging
+otlp_logs_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "http://localhost:4317")
+otlp_log_exporter = OTLPLogExporter(
+    endpoint=otlp_logs_endpoint,
+    insecure=True
+)
+logger_provider = LoggerProvider(resource=resource)
+logger_provider.add_log_record_processor(BatchLogRecordProcessor(otlp_log_exporter))
+otel_handler = LoggingHandler(level=logging.INFO, logger_provider=logger_provider)
+logging.getLogger().addHandler(otel_handler)
+otel_logs.set_logger_provider(logger_provider)
+
+# 3. Set up OpenTelemetry Metrics
+otlp_metrics_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://localhost:4317")
+metric_exporter = OTLPMetricExporter(
+    endpoint=otlp_metrics_endpoint,
+    insecure=True
+)
+metric_reader = PeriodicExportingMetricReader(metric_exporter, export_interval_millis=5000)
+meter_provider = MeterProvider(
+    resource=resource,
+    metric_readers=[metric_reader]
+)
+metrics.set_meter_provider(meter_provider)
+meter = metrics.get_meter(__name__)
+requests_counter = meter.create_counter(
+    "app.requests.total",
+    description="Total number of requests to the application",
+    unit="1"
+)
+active_users = meter.create_up_down_counter(
+    "app.active_users",
+    description="Number of active users",
+    unit="1"
+)
+request_duration_histogram = meter.create_histogram(
+    "app.request.duration",
+    description="Duration of requests",
+    unit="s",
+)
+
+# --- NEW: 4. Set up OpenTelemetry Traces ---
+otlp_traces_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4317")
+trace_exporter = OTLPSpanExporter(
+    endpoint=otlp_traces_endpoint,
+    insecure=True
+)
+tracer_provider = TracerProvider(resource=resource)
+trace.set_tracer_provider(tracer_provider)
+tracer_provider.add_span_processor(BatchSpanProcessor(trace_exporter))
+tracer = trace.get_tracer(__name__)
+
+# --- Flask App (Define app instance BEFORE instrumentation) ---
+app = flask.Flask(__name__)
+
+# Instrument Flask and Requests
+FlaskInstrumentor().instrument_app(app)
+RequestsInstrumentor().instrument()
+
+# --- Flask App Routes ---
+@app.route('/')
+def hello():
+    requests_counter.add(1, {"route": "/"})
+    logger.info("Root endpoint was called - INFO log")
+    logger.warning("Root endpoint was called - WARNING log")
+    return "Hello, World! Check the logs and metrics!"
+
+@app.route('/data')
+def get_data():
+    start_time = time.time()
+    requests_counter.add(1, {"route": "/data"})
+    try:
+        logger.info("Fetching data from external API")
+        response = requests.get("https://jsonplaceholder.typicode.com/todos/1", timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        logger.info(f"Successfully fetched data: {data.get('title')}")
+        return flask.jsonify(data)
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching data: {e}", exc_info=True)
+        return f"Error fetching data: {e}", 500
+    finally:
+        duration = time.time() - start_time
+        request_duration_histogram.record(duration, {"route": "/data"})
+
+@app.route('/login')
+def login():
+    active_users.add(1)
+    logger.info("User logged in.")
+    return "Logged in. Active users increased."
+
+@app.route('/logout')
+def logout():
+    active_users.add(-1)
+    logger.info("User logged out.")
+    return "Logged out. Active users decreased."
+
+@app.route('/error')
+def error_route():
+    requests_counter.add(1, {"route": "/error", "status": "error"})
+    try:
+        raise ValueError("This is a test error!")
+    except ValueError as e:
+        logger.error(f"An error occurred in /error route: {e}", exc_info=True)
+        return "An error was triggered and logged!", 500
+
+# # NEW ENDPOINT FOR CPU STRESS
+@app.route('/cpu-stress/<int:duration_seconds>')
+def cpu_stress(duration_seconds):
+    with tracer.start_as_current_span("cpu_stress_task"):
+        logger.info(f"Starting CPU stress for {duration_seconds} seconds.")
+        start_time = time.time()
+        count = 0
+        while True:
+            _ = math.sqrt(count) * math.log(count + 1)
+            count += 1
+            if time.time() - start_time >= duration_seconds:
+                break
+        logger.info(f"CPU stress completed. Performed {count} iterations.")
+        return f"CPU stress finished after {duration_seconds} seconds. Iterations: {count}"
+
+if __name__ == '__main__':
+    logger.info("Flask application starting up...")
+    app.run(host='0.0.0.0', port=5000)
+
+--------------------------------------------------
+File End
+--------------------------------------------------
+
+
+aiops-observability-stack\docker-compose.yml
+File type: .yml
+version: '3.8'
+
+services:
+  flask-app:
+    build: .
+    container_name: flask-otel-app
+    ports:
+      - "5001:5000"
+    command: ["gunicorn", "-w", "1", "--timeout", "120", "app:app", "--bind", "0.0.0.0:5000"]
+    environment:
+      OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: flask-otel-app
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_VERSION: "1.0.0"
+    depends_on:
+      - otel-collector
+      - elasticsearch
+    networks:
+      - monitoring_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4318:4318"
+      - "13133:13133"
+      - "55679:55679"
+      - "9464:9464"
+    networks:
+      - monitoring_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:13133/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - monitoring_network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    networks:
+      - monitoring_network
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.security.enabled=false
+      - action.auto_create_index=true
+      - cluster.routing.allocation.disk.threshold_enabled=false
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - monitoring_network
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.17.10
+    container_name: kibana
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+      KIBANA_DEFAULTAPPID: "discover"
+    networks:
+      - monitoring_network
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    privileged: true
+    networks:
+      - monitoring_network
+
+  node_exporter:
+    image: quay.io/prometheus/node-exporter:latest
+    container_name: node_exporter
+    command:
+      - '--path.rootfs=/host'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+    pid: host
+    networks:
+      - monitoring_network
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+      - "14269:14269"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      COLLECTOR_OTLP_GRPC_TLS_DISABLE: "true"
+      SPAN_STORAGE_TYPE: "memory"
+    networks:
+      - monitoring_network
+
+  # ➕ NEW: Pushgateway
+  pushgateway:
+    image: prom/pushgateway
+    container_name: pushgateway
+    ports:
+      - "9091:9091"
+    networks:
+      - monitoring_network
+
+  # ➕ NEW: ML Forecasting Service
+  ml-forecast:
+    build:
+      context: .
+      dockerfile: Dockerfile-forecast
+    container_name: ml-forecast
+    ports:
+      - "8000:8000" # Map host port 8000 to container port 8000
+    depends_on:
+      - prometheus
+    networks:
+      - monitoring_network
+
+  log-anomaly-detector:
+    build:
+      context: .
+      dockerfile: Dockerfile-anomaly
+    container_name: log-anomaly-detector
+    depends_on:
+      - elasticsearch
+    networks:
+      - monitoring_network
+
+
+
+volumes:
+  es_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  monitoring_network:
+    driver: bridge
+
+
+--------------------------------------------------
+File End
+--------------------------------------------------
+
+
+aiops-observability-stack\Dockerfile
+File type: 
+FROM python:3.9-slim
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the requirements file into the container at /app
+COPY requirements.txt .
+
+# Install any needed packages specified in requirements.txt
+# --no-cache-dir: Disables the cache, making the image smaller.
+# --trusted-host pypi.python.org: Sometimes needed in restricted network environments.
+RUN pip install --no-cache-dir --trusted-host pypi.python.org -r requirements.txt
+
+# Copy the current directory contents into the container at /app
+COPY . .
+
+# Make port 5000 available to the world outside this container
+EXPOSE 5000
+
+# Define environment variables for OpenTelemetry
+# The OTLP endpoint for logs will point to the OpenTelemetry Collector
+ENV OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://otel-collector:4317
+ENV OTEL_SERVICE_NAME=flask-otel-app
+ENV PYTHONUNBUFFERED=1 
+
+# Run app.py when the container launches
+# Using Gunicorn for a more production-like setup (optional, can use `python app.py` for simplicity)
+# CMD ["python", "app.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
+# If using gunicorn, add it to requirements.txt:
+# gunicorn
+
+
+
+--------------------------------------------------
+File End
+--------------------------------------------------
+
+
+aiops-observability-stack\Dockerfile-anomaly
+File type: 
+FROM python:3.9-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install elasticsearch scikit-learn pyod tqdm pandas
+
+COPY log_anomaly_service.py .
+
+CMD ["python", "log_anomaly_service.py"]
+
+
+--------------------------------------------------
+File End
+--------------------------------------------------
+
+
+aiops-observability-stack\Dockerfile-forecast
+File type: 
+FROM python:3.9-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY forecast_service.py .
+
+# Expose the new port for the Prometheus exporter
+EXPOSE 8000
+
+# NEW: Run the script using bash -c with Python unbuffered and dev mode
+CMD ["bash", "-c", "python -u -X dev forecast_service.py >> /proc/1/fd/1 2>&1"]
+
+--------------------------------------------------
+File End
+--------------------------------------------------
+
+
+aiops-observability-stack\otel-collector-config.yaml
+File type: .yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  debug:
+
+  elasticsearch:
+    endpoints: ["http://elasticsearch:9200"]
+    logs_index: "otel-logs"
+    # Basic configuration that works with the current exporter version
+    mapping:
+      mode: "ecs"
+
+  # Prometheus exporter for metrics
+  prometheus:
+    endpoint: "0.0.0.0:9464"
+
+  # Jaeger exporter for traces
+  otlp/jaeger:
+    endpoint: "jaeger:4317"
+    tls:
+      insecure: true
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+
+  # Add resource processor to ensure proper resource attributes
+  resource:
+    attributes:
+      - key: service.name
+        action: upsert
+        from_attribute: service.name
+      - key: service.version
+        value: "1.0.0"
+        action: upsert
+
+  resourcedetection/system:
+    detectors: [system]
+    system:
+      resource_attributes:
+        host.name:
+          enabled: true
+        os.type:
+          enabled: true
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [debug, elasticsearch]
+
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resourcedetection/system]
+      exporters: [debug, prometheus]
+
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resourcedetection/system]
+      exporters: [debug, otlp/jaeger]
+
+  # Add extensions for health checks and monitoring
+  extensions: [health_check, zpages]
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+--------------------------------------------------
+File End
+--------------------------------------------------
+
+
+aiops-observability-stack\prometheus.yml
+File type: .yml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'otel-collector'
+    static_configs:
+      - targets: ['otel-collector:9464'] # Scrape OTel Collector for app metrics
+
+  # --- NEW: Scrape cAdvisor ---
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080'] # Scrape cAdvisor for container metrics
+
+  # --- NEW: Scrape Node Exporter ---
+  - job_name: 'node_exporter'
+    static_configs:
+      - targets: ['node_exporter:9100'] # Scrape Node Exporter for host metrics
+  
+  - job_name: 'pushgateway'
+    static_configs:
+      - targets: ['pushgateway:9091']
+
+   # --- NEW: Scrape ML Forecasting Service ---
+  - job_name: 'ml_forecast_exporter'
+    static_configs:
+      - targets: ['ml-forecast:8000'] 
+
+--------------------------------------------------
+File End
+--------------------------------------------------
+
+
+aiops-observability-stack\README.md
+File type: .md
+# aiops-observability-stack
+
+--------------------------------------------------
+File End
+--------------------------------------------------
+
+
+aiops-observability-stack\requirements.txt
+File type: .txt
+flask
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation-flask
+opentelemetry-instrumentation-logging
+opentelemetry-instrumentation-wsgi
+opentelemetry-exporter-otlp-proto-grpc
+requests
+gunicorn
+opentelemetry-instrumentation-requests
+prometheus-api-client
+prometheus-client # Make sure this is present or add it
+prophet
+pandas
+elasticsearch
+scikit-learn
+pyod[all]
+tqdm
+
+--------------------------------------------------
+File End
+--------------------------------------------------
+
+
+aiops-observability-stack\test_push.py
+File type: .py
+from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+
+# Create a fresh registry
+registry = CollectorRegistry()
+
+# Define a gauge metric
+g = Gauge('test_metric', 'Test metric pushed from Python', registry=registry)
+
+# Set the metric value
+g.set(42)
+
+# Push to Pushgateway
+push_to_gateway('pushgateway:9091', job='test_job', registry=registry)
+
+print("✅ Successfully pushed test_metric = 42 to Pushgateway.")
+
+
+--------------------------------------------------
+File End
+--------------------------------------------------
+aiops-observability-stack\forecast_service.py
+File type: .py
+
+import time
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from prometheus_api_client import PrometheusConnect, MetricRangeDataFrame
+from prometheus_client import start_http_server, Gauge, CollectorRegistry
+from prophet import Prophet
+import sys
+
+# Configs
+PROM_URL = "http://prometheus:9090"
+PROMQL_QUERY = 'sum(rate(container_cpu_usage_seconds_total{name="flask-otel-app"}[1m]))'
+FORECAST_EXPORTER_PORT = 8000
+
+# Initialize Prometheus
+print("✅ Starting forecast service")
+try:
+    prom = PrometheusConnect(url=PROM_URL, disable_ssl=True)
+    print("✅ Connected to Prometheus")
+except Exception as e:
+    print(f"❌ Failed to connect to Prometheus: {e}")
+    sys.exit(1)
+
+# Setup Prometheus exporter
+registry = CollectorRegistry()
+latest_gauge = Gauge('cpu_usage_forecast_latest', 'Latest predicted CPU usage', registry=registry)
+mean_gauge = Gauge('cpu_usage_forecast_mean5', 'Mean of next 5 predicted CPU usage points', registry=registry)
+max_gauge = Gauge('cpu_usage_forecast_max5', 'Max of next 5 predicted CPU usage points', registry=registry)
+
+def fetch_data():
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(hours=6)  # increased from 1 hour to 1 day
+    print(f"🔍 Fetching data from {start_time} to {end_time}")
+    try:
+        metric_data = prom.custom_query_range(
+            query=PROMQL_QUERY,
+            start_time=start_time,
+            end_time=end_time,
+            step='15s'  # fixed: Prometheus wants seconds, not '1min'
+        )
+        df = MetricRangeDataFrame(metric_data)
+        if df.empty:
+            print("⚠ No data fetched.")
+            return None
+        df = df.reset_index()
+        df['ds'] = pd.to_datetime(df['timestamp'], unit='s')
+        df['y'] = pd.to_numeric(df['value'])
+        print(f"✅ Got {len(df)} data points")
+        return df[['ds', 'y']]
+    except Exception as e:
+        print(f"❌ Error fetching data: {e}")
+        return None
+
+
+def run_forecast(df):
+    if df is None or df.empty:
+        print("⚠ No data for forecasting")
+        return None
+    try:
+        m = Prophet(daily_seasonality=True,weekly_seasonality=True,seasonality_mode='multiplicative')
+        m.fit(df)
+        future = m.make_future_dataframe(periods=5, freq='1min')  # shorter forecast window
+        forecast = m.predict(future)
+        print(f"✅ Forecast generated for {len(forecast)} points")
+        return forecast[['ds', 'yhat']]
+    except Exception as e:
+        print(f"❌ Error running forecast: {e}")
+        return None
+
+def update_metrics(forecast_df):
+    if forecast_df is None or forecast_df.empty:
+        print("⚠ No forecast data to push")
+        return
+
+    next_points = forecast_df.tail(5)
+    latest = next_points.iloc[-1]['yhat']
+    mean5 = np.mean(next_points['yhat'])
+    max5 = np.max(next_points['yhat'])
+
+    latest_gauge.set(latest)
+    mean_gauge.set(mean5)
+    max_gauge.set(max5)
+
+    print(f"🚀 Updated metrics: latest={latest:.6f}, mean5={mean5:.6f}, max5={max5:.6f}")
+
+if __name__ == "__main__":
+    print(f"🌐 Starting Prometheus exporter on port {FORECAST_EXPORTER_PORT}")
+    start_http_server(FORECAST_EXPORTER_PORT, registry=registry)
+    print("✅ Exporter running")
+
+    while True:
+        print("\n🔄 Forecast cycle started")
+        data_df = fetch_data()
+        forecast_df = run_forecast(data_df)
+        update_metrics(forecast_df)
+        print("⏳ Sleeping 5 minutes...\n")
+        time.sleep(60)
+
+--------------------------------------------------
+File End
+--------------------------------------------------
+aiops-observability-stack\log_anomaly_service.py
+File type: .py
+
+import time
+import pandas as pd
+import numpy as np
+from elasticsearch import Elasticsearch
+from sklearn.ensemble import IsolationForest
+from sklearn.feature_extraction.text import TfidfVectorizer # New import
+from tqdm import tqdm
+import requests
+
+ES_URL = "http://elasticsearch:9200"
+es = Elasticsearch(hosts=[ES_URL])
+
+def wait_for_es(timeout=60):
+    print(f"⏳ Waiting for Elasticsearch at {ES_URL}...")
+    for _ in range(timeout):
+        try:
+            res = requests.get(ES_URL, timeout=5)
+            if res.status_code == 200:
+                print("✅ Elasticsearch is up!")
+                return
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(1)
+    print("❌ Timeout waiting for Elasticsearch!")
+    exit(1)
+
+def fetch_logs(index="otel-logs", size=10000):
+    print(f"🔍 Fetching last {size} logs from '{index}'...")
+    try:
+        res = es.search(
+            index=index,
+            body={"size": size, "sort": [{"@timestamp": {"order": "desc"}}]}, # Fetch latest logs
+        )
+        logs = [hit["_source"] for hit in res["hits"]["hits"]]
+        return pd.DataFrame(logs)
+    except Exception as e:
+        print(f"Error fetching logs from Elasticsearch: {e}")
+        return pd.DataFrame()
+
+def run_anomaly_detection(df):
+    if df.empty:
+        print("⚠ No logs to process.")
+        return pd.DataFrame()
+
+    if 'log' in df.columns:
+        df['log_level'] = df['log'].apply(lambda x: x.get('level', 'UNKNOWN') if isinstance(x, dict) else 'UNKNOWN')
+    else:
+        df['log_level'] = 'UNKNOWN'
+
+    if 'message' in df.columns:
+        df['message'] = df['message'].fillna('')
+    else:
+        df['message'] = ''
+
+
+    severity_map = {'INFO': 0, 'WARN': 1, 'ERROR': 2}
+    df['severity_score'] = df['log_level'].map(severity_map).fillna(0)
+
+    print("---")
+    print("df after severity_score:")
+    print(df[['log_level', 'severity_score']].head(10))
+    print("---")
+
+    log_level_ohe = pd.get_dummies(df['log_level'], prefix='log_level')
+
+    tfidf_vectorizer = TfidfVectorizer(max_features=500, stop_words='english',
+                                       token_pattern=r'\b[a-zA-Z]{3,}\b')
+    message_features = tfidf_vectorizer.fit_transform(df['message']).toarray()
+    print(f"✅ Message features shape: {message_features.shape}")
+
+    X = np.hstack([log_level_ohe.values, df[['severity_score']].values, message_features])
+
+    print(f"✅ Feature matrix shape: {X.shape}")
+    df['is_anomaly_rule'] = df['log_level'] == 'ERROR'
+
+    non_error_df = df[df['log_level'] != 'ERROR']
+
+    if not non_error_df.empty and len(non_error_df) > 5:
+    
+        non_error_log_level_ohe = pd.get_dummies(non_error_df['log_level'], prefix='log_level')
+    
+        non_error_message_features = tfidf_vectorizer.transform(non_error_df['message']).toarray()
+
+        X_train_ml = np.hstack([
+            non_error_log_level_ohe.reindex(columns=log_level_ohe.columns, fill_value=0).values,
+            non_error_df[['severity_score']].values,
+            non_error_message_features
+        ])
+
+        clf = IsolationForest(contamination='auto', random_state=42)
+        clf.fit(X_train_ml)
+        print("💡 Isolation Forest trained on non-ERROR logs.")
+
+    
+        df['anomaly_score'] = clf.decision_function(X)
+        df['is_anomaly_ml'] = clf.predict(X) == -1
+    else:
+        print("⚠️ Not enough non-ERROR logs to train Isolation Forest. Skipping ML anomaly detection.")
+        df['anomaly_score'] = 0.0
+        df['is_anomaly_ml'] = False
+
+    df['is_anomaly'] = df['is_anomaly_ml'] | df['is_anomaly_rule']
+
+    anomalies = df[df['is_anomaly']]
+    print(f"🚨 Found {len(anomalies)} anomalies (ML + rule combined).")
+    print("---")
+    print("Final df head:")
+    print(df.head(10))
+    print("---")
+    return anomalies
+
+def push_anomalies(df, index="log-anomalies"):
+    if df.empty:
+        print("✅ No anomalies to push.")
+        return
+    df_cleaned = df.fillna(0)
+    print(f"Pushing {len(df_cleaned)} anomalies to Elasticsearch index '{index}'...")
+    es.indices.create(index=index, ignore=400)
+
+    from elasticsearch.helpers import bulk
+    actions = [
+        {
+            "_index": index,
+            "_source": row.to_dict()
+        }
+        for _, row in df_cleaned.iterrows()
+    ]
+
+    with tqdm(total=len(actions), desc="Indexing anomalies") as pbar:
+        success, failed = bulk(es, actions, chunk_size=500, request_timeout=30, raise_on_error=False, refresh=True)
+    
+        pbar.update(len(actions))
+
+    if failed:
+        print(f"⚠️ Failed to index {len(failed)} documents.")
+    
+    print(f"✅ Successfully pushed {success} anomalies to Elasticsearch index '{index}'.")
+
+if __name__ == "__main__":
+    wait_for_es()
+    while True:
+        df_logs = fetch_logs()
+        anomalies = run_anomaly_detection(df_logs)
+        push_anomalies(anomalies)
+        print("⏳ Sleeping 2 minutes...\n")
+        time.sleep(120)
+
+--------------------------------------------------
+File End
+--------------------------------------------------
+aiops-observability-stack\Setup.py
+File type: .py
+
+#!/usr/bin/env python3
+"""
+Script to setup Elasticsearch index template for OpenTelemetry logs
+Run this after starting your docker-compose stack
+"""
+
+import requests
+import json
+import time
+import sys
+
+def wait_for_elasticsearch(host="http://localhost:9200", timeout=60):
+    """Wait for Elasticsearch to be ready"""
+    print(f"Waiting for Elasticsearch at {host}...")
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        try:
+            response = requests.get(f"{host}/_cluster/health", timeout=5)
+            if response.status_code == 200:
+                health = response.json()
+                print(f"Elasticsearch is ready! Status: {health['status']}")
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        
+        print("Waiting for Elasticsearch...")
+        time.sleep(5)
+    
+    print("Timeout waiting for Elasticsearch!")
+    return False
+
+def create_index_template(host="http://localhost:9200"):
+    """Create index template for OpenTelemetry logs"""
+    
+    template = {
+        "index_patterns": ["otel-logs*"],
+        "template": {
+            "settings": {
+                "number_of_shards": 1,
+                "number_of_replicas": 0,
+                "index.refresh_interval": "5s"
+            },
+            "mappings": {
+                "properties": {
+                    "@timestamp": {
+                        "type": "date"
+                    },
+                    "observedTimeUnixNano": {
+                        "type": "long"
+                    },
+                    "timeUnixNano": {
+                        "type": "long"
+                    },
+                    "severityNumber": {
+                        "type": "integer"
+                    },
+                    "severityText": {
+                        "type": "keyword"
+                    },
+                    "body": {
+                        "type": "text"
+                    },
+                    "traceId": {
+                        "type": "keyword"
+                    },
+                    "spanId": {
+                        "type": "keyword"
+                    },
+                    "resource": {
+                        "type": "object"
+                    },
+                    "attributes": {
+                        "type": "object"
+                    }
+                }
+            }
+        }
+    }
+    
+    try:
+        response = requests.put(
+            f"{host}/_index_template/otel-logs-template",
+            json=template,
+            headers={"Content-Type": "application/json"}
+        )
+        
+        if response.status_code in [200, 201]:
+            print("✅ Index template created successfully!")
+            return True
+        else:
+            print(f"❌ Failed to create index template: {response.status_code}")
+            print(response.text)
+            return False
+            
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error creating index template: {e}")
+        return False
+
+def check_indices(host="http://localhost:9200"):
+    """Check existing indices"""
+    try:
+        response = requests.get(f"{host}/_cat/indices?v", timeout=5)
+        if response.status_code == 200:
+            print("\n📋 Current indices:")
+            print(response.text)
+        else:
+            print(f"❌ Failed to get indices: {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error getting indices: {e}")
+
+def main():
+    print("🔧 Setting up Elasticsearch for OpenTelemetry logs")
+    
+    # Wait for Elasticsearch
+    if not wait_for_elasticsearch():
+        sys.exit(1)
+    
+    # Create index template
+    if create_index_template():
+        print("✅ Setup completed successfully!")
+    else:
+        print("❌ Setup failed!")
+        sys.exit(1)
+    
+    # Show current indices
+    check_indices()
+    
+    print("\n🎉 Elasticsearch is ready for OpenTelemetry logs!")
+    print("You can now start sending logs and view them in Kibana at http://localhost:5601")
+
+if __name__ == "__main__":
+    main()
